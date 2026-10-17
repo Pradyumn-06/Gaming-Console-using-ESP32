@@ -1,0 +1,468 @@
+/*
+  ESP32 Gaming Console  -  Snake + Mario runner
+  Hardware: ESP32, 128x64 SSD1306 I2C OLED, analog joystick, passive piezo buzzer
+  Libraries: Adafruit GFX, Adafruit SSD1306
+
+  Pins:
+    OLED SDA -> GPIO21, SCL -> GPIO22 (VCC 3V3, GND)
+    Joystick VRx -> GPIO34, VRy -> GPIO35, SW -> GPIO32 (VCC 3V3, GND)
+    Buzzer (+) -> GPIO25, (-) -> GND
+
+  Controls:
+    Menu : stick up/down = choose, press = start
+    Snake: stick = steer
+    Mario: press = jump (hold = higher), stick left/right = move
+    In game: hold button ~1.2 s = back to menu
+*/
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Preferences.h>
+
+// ---------------- Configuration ----------------
+#define OLED_W 128
+#define OLED_H 64
+#define OLED_ADDR 0x3C      // try 0x3D if the screen stays blank
+
+#define PIN_SDA 21
+#define PIN_SCL 22
+#define PIN_JOY_X 34
+#define PIN_JOY_Y 35
+#define PIN_JOY_SW 32
+#define PIN_BUZZER 25
+
+#define INVERT_X false      // set true if left/right feel reversed
+#define INVERT_Y false      // set true if up/down feel reversed
+#define SWAP_XY false       // set true if the stick is mounted rotated 90 deg
+
+#define FRAME_MS 33         // ~30 fps
+#define LONG_PRESS_MS 1200  // hold to return to menu
+
+Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, -1);
+Preferences prefs;
+
+// ---------------- Input ----------------
+int dirX = 0, dirY = 0, prevDirX = 0, prevDirY = 0;
+bool btnDown = false, btnPressed = false, longPress = false, longFired = false;
+uint32_t btnSince = 0;
+
+void readInput() {
+  int rx = analogRead(PIN_JOY_X);
+  int ry = analogRead(PIN_JOY_Y);
+  if (SWAP_XY) { int t = rx; rx = ry; ry = t; }
+
+  prevDirX = dirX;
+  prevDirY = dirY;
+  dirX = (rx < 1000) ? -1 : (rx > 3000) ? 1 : 0;
+  dirY = (ry < 1000) ? -1 : (ry > 3000) ? 1 : 0;
+  if (INVERT_X) dirX = -dirX;
+  if (INVERT_Y) dirY = -dirY;
+
+  bool down = (digitalRead(PIN_JOY_SW) == LOW);
+  btnPressed = down && !btnDown;
+  if (btnPressed) { btnSince = millis(); longFired = false; }
+  longPress = false;
+  if (down && !longFired && millis() - btnSince > LONG_PRESS_MS) {
+    longPress = true;
+    longFired = true;
+  }
+  btnDown = down;
+}
+
+// ---------------- Sound ----------------
+uint32_t toneEnd = 0;
+
+void buzzWrite(int freq) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWriteTone(PIN_BUZZER, freq);
+#else
+  ledcWriteTone(0, freq);
+#endif
+}
+
+void soundInit() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(PIN_BUZZER, 2000, 8);
+#else
+  ledcSetup(0, 2000, 8);
+  ledcAttachPin(PIN_BUZZER, 0);
+#endif
+  buzzWrite(0);
+}
+
+void beep(int freq, int ms) {
+  buzzWrite(freq);
+  toneEnd = millis() + ms;
+}
+
+void soundUpdate() {
+  if (toneEnd && millis() > toneEnd) {
+    buzzWrite(0);
+    toneEnd = 0;
+  }
+}
+// ---------------- Helpers ----------------
+void drawCentered(const char *s, int y, int size = 1) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.setTextSize(size);
+  display.getTextBounds(s, 0, y, &x1, &y1, &w, &h);
+  display.setCursor((OLED_W - w) / 2, y);
+  display.print(s);
+}
+void drawGameOver(int score, int hi) {
+  display.fillRect(10, 14, 108, 38, SSD1306_BLACK);
+  display.drawRect(10, 14, 108, 38, SSD1306_WHITE);
+  drawCentered("GAME OVER", 18);
+  char buf[24];
+  snprintf(buf, sizeof(buf), "Score:%d Hi:%d", score, hi);
+  drawCentered(buf, 29);
+  drawCentered("Press to retry", 40);
+  display.setTextSize(1);
+}
+void drawTopBar(int score, int hi) {
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("Score:");
+  display.print(score);
+  char buf[16];
+  snprintf(buf, sizeof(buf), "Hi:%d", hi);
+  display.setCursor(OLED_W - 6 * strlen(buf), 0);
+  display.print(buf);
+  display.drawFastHLine(0, 8, OLED_W, SSD1306_WHITE);
+}
+// ---------------- State ----------------
+enum State { ST_MENU, ST_SNAKE, ST_MARIO };
+State state = ST_MENU;
+int menuSel = 0;
+uint32_t hiSnake = 0, hiMario = 0;
+// =====================================================
+//                       SNAKE
+// =====================================================
+#define CELL 4
+#define GRID_W 32
+#define GRID_H 13
+#define GRID_Y 9            // play area starts below top bar
+struct Pt { int8_t x, y; };
+Pt snake[GRID_W * GRID_H];
+int snakeLen, sdx, sdy, ndx, ndy, snakeScore, snakeStepMs;
+Pt food;
+uint32_t snakeLastStep, snakeOverAt;
+bool snakeOver;
+void placeFood() {
+  bool ok;
+  do {
+    food.x = random(GRID_W);
+    food.y = random(GRID_H);
+    ok = true;
+    for (int i = 0; i < snakeLen; i++) {
+      if (snake[i].x == food.x && snake[i].y == food.y) { ok = false; break; }
+    }
+  } while (!ok);
+}
+void snakeInit() {
+  snakeLen = 3;
+  for (int i = 0; i < snakeLen; i++) { snake[i].x = 16 - i; snake[i].y = 6; }
+  sdx = 1; sdy = 0; ndx = 1; ndy = 0;
+  snakeScore = 0;
+  snakeStepMs = 140;
+  snakeOver = false;
+  placeFood();
+  snakeLastStep = millis();
+}
+void snakeUpdate() {
+  if (snakeOver) {
+    if (btnPressed && millis() - snakeOverAt > 600) snakeInit();
+    return;
+  }
+  // steering (can't reverse into yourself)
+  if (dirX != 0 && sdx == 0) { ndx = dirX; ndy = 0; }
+  else if (dirY != 0 && sdy == 0) { ndx = 0; ndy = dirY; }
+  if (millis() - snakeLastStep < (uint32_t)snakeStepMs) return;
+  snakeLastStep = millis();
+  sdx = ndx; sdy = ndy;
+  int nx = snake[0].x + sdx;
+  int ny = snake[0].y + sdy;
+  bool eat = (nx == food.x && ny == food.y);
+  bool dead = (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H);
+  if (!dead) {
+    int lim = eat ? snakeLen : snakeLen - 1;  // tail moves away unless growing
+    for (int i = 0; i < lim; i++) {
+      if (snake[i].x == nx && snake[i].y == ny) { dead = true; break; }
+    }
+  }
+  if (dead) {
+    snakeOver = true;
+    snakeOverAt = millis();
+    beep(150, 400);
+    if ((uint32_t)snakeScore > hiSnake) {
+      hiSnake = snakeScore;
+      prefs.putUInt("snake", hiSnake);
+    }
+    return;
+  }
+  if (eat && snakeLen < GRID_W * GRID_H) snakeLen++;
+  for (int i = snakeLen - 1; i > 0; i--) snake[i] = snake[i - 1];
+  snake[0].x = nx;
+  snake[0].y = ny;
+  if (eat) {
+    snakeScore++;
+    if (snakeStepMs > 60) snakeStepMs -= 3;
+    beep(1200, 60);
+    placeFood();
+  }
+}
+void snakeDraw() {
+  drawTopBar(snakeScore, hiSnake);
+  // body
+  for (int i = 1; i < snakeLen; i++) {
+    display.fillRect(snake[i].x * CELL, GRID_Y + snake[i].y * CELL, CELL - 1, CELL - 1, SSD1306_WHITE);
+  }
+  // head
+  display.fillRect(snake[0].x * CELL, GRID_Y + snake[0].y * CELL, CELL, CELL, SSD1306_WHITE);
+  // food (plus shape)
+  int fx = food.x * CELL, fy = GRID_Y + food.y * CELL;
+  display.fillRect(fx + 1, fy, 2, CELL, SSD1306_WHITE);
+  display.fillRect(fx, fy + 1, CELL, 2, SSD1306_WHITE);
+  if (snakeOver) drawGameOver(snakeScore, hiSnake);
+}
+// =====================================================
+//                MARIO (side-scroller runner)
+// =====================================================
+#define GROUND 56
+#define MAX_OBJ 6
+const uint8_t marioA[] PROGMEM = {0x3C, 0x7E, 0x34, 0x3E, 0x3C, 0x7E, 0x5A, 0x24};
+const uint8_t marioB[] PROGMEM = {0x3C, 0x7E, 0x34, 0x3E, 0x3C, 0x7E, 0x5A, 0x42};
+const uint8_t goombaSpr[] PROGMEM = {0x18, 0x3C, 0x7E, 0xDB, 0xFF, 0x7E, 0x24, 0x66};
+struct Obj {
+  uint8_t type;   // 1 = pipe, 2 = goomba, 3 = coin
+  float x;
+  int w, h, y;
+  bool alive;
+};
+Obj objs[MAX_OBJ];
+float mx, my, mvy, speed, scoreF, spawnTimer, groundOff;
+int nextGap, animT;
+bool onGround, marioOver;
+uint32_t marioOverAt;
+void spawnObj(uint8_t type, float x, int w, int h, int y) {
+  for (int i = 0; i < MAX_OBJ; i++) {
+    if (!objs[i].alive) {
+      objs[i].type = type;
+      objs[i].x = x;
+      objs[i].w = w;
+      objs[i].h = h;
+      objs[i].y = y;
+      objs[i].alive = true;
+      return;
+    }
+  }
+}
+void marioSpawn() {
+  int r = random(10);
+  if (r < 5) {                       // pipe (+ maybe coin above)
+    int h = random(2) ? 12 : 16;
+    spawnObj(1, OLED_W, 12, h, GROUND - h);
+    if (random(2)) spawnObj(3, OLED_W + 4, 5, 5, GROUND - h - 16);
+  } else if (r < 8) {                // goomba
+    spawnObj(2, OLED_W, 8, 8, GROUND - 8);
+  } else {                           // coin pair
+    spawnObj(3, OLED_W, 5, 5, GROUND - 22);
+    spawnObj(3, OLED_W + 12, 5, 5, GROUND - 22);
+  }
+}
+void marioInit() {
+  mx = 10; my = GROUND - 8; mvy = 0;
+  onGround = true;
+  speed = 2.0f;
+  scoreF = 0;
+  spawnTimer = 0;
+  nextGap = 60;
+  groundOff = 0;
+  animT = 0;
+  marioOver = false;
+  for (int i = 0; i < MAX_OBJ; i++) objs[i].alive = false;
+}
+void marioDie() {
+  marioOver = true;
+  marioOverAt = millis();
+  beep(150, 400);
+  if ((uint32_t)scoreF > hiMario) {
+    hiMario = (uint32_t)scoreF;
+    prefs.putUInt("mario", hiMario);
+  }
+}
+void marioUpdate() {
+  if (marioOver) {
+    if (btnPressed && millis() - marioOverAt > 600) marioInit();
+    return;
+  }
+  speed = 2.0f + fminf(1.5f, scoreF / 80.0f);
+  // horizontal move
+  mx += dirX * 1.5f;
+  if (mx < 2) mx = 2;
+  if (mx > 64) mx = 64;
+  // jump + gravity
+  float prevBottom = my + 8;
+  if (btnPressed && onGround) {
+    mvy = -5.2f;
+    onGround = false;
+    beep(700, 70);
+  }
+  if (!btnDown && mvy < -2.5f) mvy = -2.5f;   // short hop if released early
+  mvy += 0.5f;
+  my += mvy;
+  if (my >= GROUND - 8) {
+    my = GROUND - 8;
+    mvy = 0;
+    onGround = true;
+  }
+  // world scroll + spawning
+  groundOff += speed;
+  if (groundOff >= 8) groundOff -= 8;
+  spawnTimer += speed;
+  if (spawnTimer >= nextGap) {
+    spawnTimer = 0;
+    nextGap = random(90, 151);
+    marioSpawn();
+  }
+  scoreF += speed / 20.0f;
+  animT++;
+  // objects + collisions
+  for (int i = 0; i < MAX_OBJ; i++) {
+    Obj &o = objs[i];
+    if (!o.alive) continue;
+    o.x -= speed + (o.type == 2 ? 0.6f : 0.0f);
+    if (o.x + o.w < 0) { o.alive = false; continue; }
+    bool hit = (mx + 1 < o.x + o.w) && (mx + 7 > o.x) && (my < o.y + o.h) && (my + 8 > o.y);
+    if (!hit) continue;
+    if (o.type == 3) {                          // coin
+      o.alive = false;
+      scoreF += 1;
+      beep(1500, 50);
+    } else if (o.type == 2 && mvy > 0 && prevBottom <= o.y + 3) {   // stomp
+      o.alive = false;
+      mvy = -3.5f;
+      onGround = false;
+      scoreF += 3;
+      beep(1000, 80);
+    } else {                                    // pipe or side hit
+      marioDie();
+      return;
+    }
+  }
+}
+void marioDraw() {
+  drawTopBar((int)scoreF, hiMario);
+  // ground with scrolling bricks
+  display.drawFastHLine(0, GROUND, OLED_W, SSD1306_WHITE);
+  display.drawFastHLine(0, GROUND + 4, OLED_W, SSD1306_WHITE);
+  int off = (int)groundOff;
+  for (int x = -off; x < OLED_W; x += 8) {
+    display.drawFastVLine(x, GROUND + 1, 3, SSD1306_WHITE);
+    display.drawFastVLine(x + 4, GROUND + 5, 3, SSD1306_WHITE);
+  }
+  // objects
+  for (int i = 0; i < MAX_OBJ; i++) {
+    Obj &o = objs[i];
+    if (!o.alive) continue;
+    int ox = (int)o.x;
+    if (o.type == 1) {                          // pipe
+      display.fillRect(ox, o.y, o.w, 4, SSD1306_WHITE);
+      display.drawRect(ox + 1, o.y + 4, o.w - 2, o.h - 4, SSD1306_WHITE);
+      display.drawFastVLine(ox + 3, o.y + 5, o.h - 5, SSD1306_WHITE);
+    } else if (o.type == 2) {                   // goomba
+      display.drawBitmap(ox, o.y, goombaSpr, 8, 8, SSD1306_WHITE);
+    } else {                                    // coin
+      display.drawCircle(ox + 2, o.y + 2, 2, SSD1306_WHITE);
+      display.drawPixel(ox + 2, o.y + 2, SSD1306_WHITE);
+    }
+  }
+  // Mario
+  const uint8_t *spr = (onGround && ((animT / 4) % 2)) ? marioB : marioA;
+  display.drawBitmap((int)mx, (int)my, spr, 8, 8, SSD1306_WHITE);
+
+  if (marioOver) drawGameOver((int)scoreF, hiMario);
+}
+
+// =====================================================
+//                       MENU
+// =====================================================
+void menuUpdate() {
+  if (dirY != 0 && dirY != prevDirY) {
+    menuSel = 1 - menuSel;
+    beep(900, 25);
+  }
+  if (btnPressed) {
+    beep(1400, 80);
+    if (menuSel == 0) { state = ST_SNAKE; snakeInit(); }
+    else              { state = ST_MARIO; marioInit(); }
+  }
+}
+void menuDraw() {
+  drawCentered("ESP32 GAMES", 0);
+  display.drawFastHLine(0, 10, OLED_W, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(10, 22);
+  display.print(menuSel == 0 ? "> " : "  ");
+  display.print("SNAKE");
+  display.setCursor(80, 22);
+  display.print("Hi:");
+  display.print(hiSnake);
+  display.setCursor(10, 36);
+  display.print(menuSel == 1 ? "> " : "  ");
+  display.print("MARIO");
+  display.setCursor(80, 36);
+  display.print("Hi:");
+  display.print(hiMario);
+
+  drawCentered("Stick:pick Press:play", 56);
+}
+// =====================================================
+//                  SETUP / LOOP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_JOY_SW, INPUT_PULLUP);
+  analogReadResolution(12);
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setClock(400000);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("SSD1306 not found - check wiring / address");
+    for (;;) delay(1000);
+  }
+  display.setTextColor(SSD1306_WHITE);
+  display.clearDisplay();
+  display.display();
+  soundInit();
+  prefs.begin("console", false);
+  hiSnake = prefs.getUInt("snake", 0);
+  hiMario = prefs.getUInt("mario", 0);
+  // splash
+  display.clearDisplay();
+  drawCentered("GAME", 12, 2);
+  drawCentered("CONSOLE", 32, 2);
+  display.display();
+  beep(800, 100);
+  delay(1200);
+}
+uint32_t lastFrame = 0;
+void loop() {
+  uint32_t now = millis();
+  if (now - lastFrame < FRAME_MS) return;
+  lastFrame = now;
+  readInput();
+  soundUpdate();
+  if (longPress && state != ST_MENU) {
+    state = ST_MENU;
+    beep(500, 100);
+  }
+  display.clearDisplay();
+  switch (state) {
+    case ST_MENU:  menuUpdate();  menuDraw();  break;
+    case ST_SNAKE: snakeUpdate(); snakeDraw(); break;
+    case ST_MARIO: marioUpdate(); marioDraw(); break;
+  }
+  display.display();
+}
